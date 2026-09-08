@@ -1,4 +1,6 @@
 from backend.services.statistics import update_statistics
+from backend.services.memory_monitor import log_memory
+
 import io
 import base64
 from pathlib import Path
@@ -17,60 +19,166 @@ from anomaly_detection.severity import calculate_severity_score
 from anomaly_detection.yolo_helper import crop_product
 
 # ── Global Model Caches ─────────────────────────────────────────────────────
-_AUTOENCODER_CACHE = {}   # category → model
-_CLASSIFIER_CACHE  = {}   # category → (model, class_list)
+_AUTOENCODER_CACHE = {}
+_CLASSIFIER_CACHE = {}
 
+_CURRENT_AUTOENCODER_CATEGORY = None
+_CURRENT_CLASSIFIER_CATEGORY = None
 
 # ── Model Loaders ───────────────────────────────────────────────────────────
 
 def load_autoencoder(category: str) -> AnomalyAutoencoder:
-    """Loads and caches the AnomalyAutoencoder for the given category."""
+    """
+    Loads only the currently required autoencoder.
+    The previous category's model is released before loading a new one.
+    """
+    global _AUTOENCODER_CACHE, _CURRENT_AUTOENCODER_CATEGORY
+
     category = category.lower()
-    if category in _AUTOENCODER_CACHE:
+
+    # Reuse model if the same category is requested
+    if (
+        _CURRENT_AUTOENCODER_CATEGORY == category
+        and category in _AUTOENCODER_CACHE
+    ):
         return _AUTOENCODER_CACHE[category]
 
+    # Release previous autoencoder
+    if _AUTOENCODER_CACHE:
+        old_category = _CURRENT_AUTOENCODER_CATEGORY
+        print(f"[inference] Releasing autoencoder for '{old_category}'")
+
+        old_model = _AUTOENCODER_CACHE.pop(old_category, None)
+
+        if old_model is not None:
+            del old_model
+
+        _CURRENT_AUTOENCODER_CATEGORY = None
+
+        import gc
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     device = torch.device(config.DEVICE)
+
     model = AnomalyAutoencoder().to(device)
 
     weights_path = config.MODEL_DIR / f"autoencoder_{category}.pth"
+
     if weights_path.exists():
         try:
-            model.load_state_dict(torch.load(weights_path, map_location=device))
+            model.load_state_dict(
+                torch.load(
+                    weights_path,
+                    map_location=device,
+                    weights_only=True
+                )
+            )
             print(f"[inference] Loaded autoencoder weights: {weights_path.name}")
         except Exception as e:
-            print(f"[inference] Warning loading autoencoder for '{category}': {e}")
+            print(
+                f"[inference] Warning loading autoencoder "
+                f"for '{category}': {e}"
+            )
     else:
-        print(f"[inference] No weights found for '{category}' — running with random init.")
+        print(
+            f"[inference] No weights found for '{category}' "
+            f"— running with random init."
+        )
 
     model.eval()
+
     _AUTOENCODER_CACHE[category] = model
+    _CURRENT_AUTOENCODER_CATEGORY = category
+
     return model
 
 
 def load_classifier_model(category: str):
-    """Loads and caches the DefectClassifier for the given category."""
+    """
+    Loads only the currently required classifier.
+    Releases the previous category's classifier from memory.
+    """
+    global _CLASSIFIER_CACHE, _CURRENT_CLASSIFIER_CATEGORY
+
     category = category.lower()
-    if category in _CLASSIFIER_CACHE:
+
+    # Reuse current classifier
+    if (
+        _CURRENT_CLASSIFIER_CATEGORY == category
+        and category in _CLASSIFIER_CACHE
+    ):
         return _CLASSIFIER_CACHE[category]
 
-    device = torch.device(config.DEVICE)
-    class_list = CATEGORY_DEFECT_CLASSES.get(category, ["good", "defective"])
+    # Release previous classifier
+    if _CLASSIFIER_CACHE:
+        old_category = _CURRENT_CLASSIFIER_CATEGORY
+        print(f"[inference] Releasing classifier for '{old_category}'")
 
-    model = DefectClassifier(num_classes=len(class_list)).to(device)
+        old_entry = _CLASSIFIER_CACHE.pop(old_category, None)
+
+        if old_entry is not None:
+            old_model = old_entry[0]
+
+            if old_model is not None:
+                del old_model
+
+        _CURRENT_CLASSIFIER_CATEGORY = None
+
+        import gc
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    device = torch.device(config.DEVICE)
+
+    class_list = CATEGORY_DEFECT_CLASSES.get(
+        category,
+        ["good", "defective"]
+    )
+
+    model = DefectClassifier(
+        num_classes=len(class_list)
+    ).to(device)
+
     weights_path = config.MODEL_DIR / f"classifier_{category}.pth"
 
     loaded = False
+
     if weights_path.exists():
         try:
-            model.load_state_dict(torch.load(weights_path, map_location=device))
+            model.load_state_dict(
+                torch.load(
+                    weights_path,
+                    map_location=device,
+                    weights_only=True
+                )
+            )
+
             loaded = True
-            print(f"[inference] Loaded classifier weights: {weights_path.name}")
+
+            print(
+                f"[inference] Loaded classifier weights: "
+                f"{weights_path.name}"
+            )
+
         except Exception as e:
-            print(f"[inference] Warning loading classifier for '{category}': {e}")
+            print(
+                f"[inference] Warning loading classifier "
+                f"for '{category}': {e}"
+            )
 
     model.eval()
-    _CLASSIFIER_CACHE[category] = (model if loaded else None, class_list)
-    return _CLASSIFIER_CACHE[category]
+
+    result = (model if loaded else None, class_list)
+
+    _CLASSIFIER_CACHE[category] = result
+    _CURRENT_CLASSIFIER_CATEGORY = category
+
+    return result
 
 
 # ── SSIM Computation ────────────────────────────────────────────────────────
@@ -154,6 +262,7 @@ def predict_defect(image_input, category: str = "bottle", enable_yolo: bool = Tr
     """
     start_time = time.perf_counter()
     category = category.lower()
+    log_memory("START")
 
     # ── 1. Input Parsing & Auto Category Detection ───────────────────────────
     if isinstance(image_input, (str, Path)):
@@ -215,8 +324,10 @@ def predict_defect(image_input, category: str = "bottle", enable_yolo: bool = Tr
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
 
+    log_memory("BEFORE AUTOENCODER")
     with torch.inference_mode():
         reconstructed_tensor = ae_model(input_tensor)              # (1, 3, 128, 128)
+    log_memory("AFTER AUTOENCODER")
 
     # ── 5. Hybrid MAE Anomaly Map & Peak Score ──────────────────────────────
     diff_tensor = torch.abs(input_tensor - reconstructed_tensor)     # (1, 3, H, W)
@@ -252,11 +363,13 @@ def predict_defect(image_input, category: str = "bottle", enable_yolo: bool = Tr
         class_confidence = 99.9
     elif is_anomaly:
         classifier_model, class_list = load_classifier_model(category)
+        log_memory("BEFORE CLASSIFIER")
         if classifier_model is not None:
             # Exclude 'good' when an anomaly is detected so specific defect type is identified
             predicted_class, class_confidence, class_probs = classifier_model.predict_class(
                 input_tensor, class_list, exclude_good=True
             )
+            log_memory("AFTER CLASSIFIER")
             if predicted_class == "good" or predicted_class == "class_0":
                 predicted_class  = "defect_detected"
                 class_confidence = round(min(99.0, max(70.0, (anomaly_score / max(1e-6, threshold)) * 40.0)), 2)
@@ -308,47 +421,68 @@ def predict_defect(image_input, category: str = "bottle", enable_yolo: bool = Tr
 
 
     processing_time_ms = round(
-       (time.perf_counter() - start_time) * 1000,
-       2
-    )
-    
-    return {
-    "category": category,
-
-    "is_anomaly": is_anomaly,
-    "defect_result": defect_result,
-    "defect_class": predicted_class,
-    "confidence_score": class_confidence,
-
-    "anomaly_score": round(anomaly_score, 6),
-    "threshold": round(threshold, 6),
-
-    "severity_score": round(
-        severity_dict["severity_score"],
+        (time.perf_counter() - start_time) * 1000,
         2
-    ),
-    "severity_level": severity_dict["severity_level"],
-    "recommended_action": severity_dict["recommended_action"],
+    )
 
-    "yolo_status": yolo_status,
-    "bbox": bbox,
+    result = {
+        "category": category,
 
-    "class_probabilities": class_probs,
+        "is_anomaly": is_anomaly,
+        "defect_result": defect_result,
+        "defect_class": predicted_class,
+        "confidence_score": class_confidence,
 
-    "quality_report": quality_report,
+        "anomaly_score": round(anomaly_score, 6),
+        "threshold": round(threshold, 6),
 
-    "severity_breakdown": severity_dict["breakdown"],
+        "severity_score": round(
+            severity_dict["severity_score"],
+            2
+        ),
+        "severity_level": severity_dict["severity_level"],
+        "recommended_action": severity_dict["recommended_action"],
 
-    "processing_time_ms": processing_time_ms,
+        "yolo_status": yolo_status,
+        "bbox": bbox,
+
+        "class_probabilities": class_probs,
+
+        "quality_report": quality_report,
+
+        "severity_breakdown": severity_dict["breakdown"],
+
+        "processing_time_ms": processing_time_ms,
+
+        "images": {
+            "original": pil_to_base64_uri(pil_img),
+            "cropped": pil_to_base64_uri(cropped_img),
+            "reconstructed": pil_to_base64_uri(reconstructed_pil),
+            "heatmap": pil_to_base64_uri(heatmap_pil),
+            "overlay": pil_to_base64_uri(overlay_pil),
+        },
+    }
 
     # -----------------------------------------
-    # Generated inspection images
+    # Release inference-only tensors
     # -----------------------------------------
-    "images": {
-        "original": pil_to_base64_uri(pil_img),
-        "cropped": pil_to_base64_uri(cropped_img),
-        "reconstructed": pil_to_base64_uri(reconstructed_pil),
-        "heatmap": pil_to_base64_uri(heatmap_pil),
-        "overlay": pil_to_base64_uri(overlay_pil),
-    },
-}
+    del input_tensor
+    del reconstructed_tensor
+    del diff_tensor
+    del anomaly_map
+    del anomaly_map_np
+    del heat_u8
+    del heat_color
+    del crop_np
+    del overlay_np
+    del ae_model
+
+    import gc
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    log_memory("END")
+
+    return result

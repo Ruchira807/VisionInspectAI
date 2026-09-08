@@ -94,3 +94,7 @@ backend/models/*.db
 *.sqlite3
 # Local database backup
 visioninspect_backup.db
+.vercel
+
+# Milestone Reports
+Milestone *.pdf

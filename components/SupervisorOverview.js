@@ -52,7 +52,7 @@ export default function SupervisorOverview() {
             headers: authHeaders,
           }),
 
-          fetch(`${BASE}/history`, {
+          fetch(`${BASE}/admin/history`, {
             headers: authHeaders,
           }),
 
